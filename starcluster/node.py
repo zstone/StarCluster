@@ -3,6 +3,11 @@ import stat
 import base64
 import posixpath
 import subprocess
+import string
+import re
+import tempfile
+import os
+from os.path import expanduser
 
 from starcluster import utils
 from starcluster import static
@@ -905,10 +910,33 @@ class Node(object):
             instance_id = alias or self.id
             raise exception.InstanceNotRunning(instance_id, self.state,
                                                label=label)
+
+        log.debug("Fetching console output for instance %s" % self.id)
+        console_str = ''
+        t0 = int(time.time())
+        while True:
+            console_output = self.instance.get_console_output().output
+            console_str = ''.join([c for c in console_output \
+                                       if c in string.printable])
+            if len(console_str) > 0:
+                break
+            log.info("Waiting five seconds for console output " +
+                     "to become available...")
+            time.sleep(5)
+            t1 = int(time.time())
+            log.info("[Have waited %s seconds total] " % (t1 - t0))
+
+        # Extract the RSA host key fingerprint from the console output
+        p = re.compile("ec2: 2048 (\S+) \S+ \(RSA\)")
+        valid_fingerprint = list(set(p.findall(console_str)))[0]
+
         user = user or self.user
         if utils.has_required(['ssh']):
             log.debug("Using native OpenSSH client")
-            sshopts = '-i %s' % self.key_location
+
+            # Force the SSH connection to fail if the provided key
+            # fingerprint does not match the one in the console output
+            sshopts = '-o StrictHostKeyChecking=yes -i %s' % self.key_location
             if forward_x11:
                 sshopts += ' -Y'
             ssh_cmd = static.SSH_TEMPLATE % dict(opts=sshopts, user=user,
@@ -917,18 +945,82 @@ class Node(object):
                 command = "'source /etc/profile && %s'" % command
                 ssh_cmd = ' '.join([ssh_cmd, command])
             log.debug("ssh_cmd: %s" % ssh_cmd)
+
+            log.debug("Fetching putative host key with ssh-keyscan")
+            keyscan_cmd = "ssh-keyscan -t rsa %s" % self.dns_name
+            log.debug("ssh-keyscan_cmd: %s" % keyscan_cmd)
+            proc = subprocess.Popen(keyscan_cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    shell=True)
+            putative_host_key = proc.communicate()[0]
+
+            log.debug("Computing fingerprint of putative host key")
+            tmp_key = tempfile.NamedTemporaryFile(suffix='.key')
+            tmp_key.write(putative_host_key)
+            tmp_key.flush()
+            keygen_cmd = "ssh-keygen -lf %s" % tmp_key.name
+            log.debug("ssh-keygen_cmd: %s" % keygen_cmd)
+            proc = subprocess.Popen(keygen_cmd,
+                                    stdout=subprocess.PIPE,
+                                    shell=True)
+            resp = proc.communicate()[0]
+            putative_fingerprint = resp.split(' ')[1]
+
+            log.debug("SSH key fingerprint from ssh-keyscan:")
+            log.debug(putative_fingerprint)
+            log.debug("SSH key fingerprint from console:")
+            log.debug(valid_fingerprint)
+
+            if putative_fingerprint == valid_fingerprint:
+                log.debug("Putative fingerprint matches " +
+                         "valid fingerprint as desired")
+
+                log.debug("Adding key from ssh-keyscan to known_hosts")
+                keygen_cmd_2 = "ssh-keygen -R %s" % self.dns_name
+                log.debug("ssh-keygen_cmd_2: %s" % keygen_cmd_2)
+                proc = subprocess.Popen(keygen_cmd_2,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        shell=True)
+                resp_out, resp_err = proc.communicate()
+                log.debug(resp_err.rstrip())
+
+                keygen_cmd_3 = "ssh-keygen -H -f %s" % tmp_key.name
+                log.debug("ssh-keygen_cmd_3: %s" % keygen_cmd_3)
+                proc = subprocess.Popen(keygen_cmd_3,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        shell=True)
+                resp_out, resp_err = proc.communicate()
+                log.debug(resp_err.rstrip())
+
+                old_key_path = tmp_key.name + ".old"
+                os.unlink(old_key_path)
+                log.debug("[Temporary file %s now deleted but not shredded]" \
+                             % old_key_path)
+
+                with open(tmp_key.name) as new_tmp:
+                    hashed_key = new_tmp.read()
+                    with open(expanduser("~/.ssh/known_hosts"), 'a') as f:
+                        f.write(hashed_key.rstrip())
+                        f.write("\n")
+            else:
+                raise Exception("ERROR: Host fingerprint mismatch")
+
             return subprocess.call(ssh_cmd, shell=True)
         else:
-            log.debug("Using Pure-Python SSH client")
-            if forward_x11:
-                log.warn("X11 Forwarding not available in Python SSH client")
-            if command:
-                orig_user = self.ssh.get_current_user()
-                self.ssh.switch_user(user)
-                self.ssh.execute(command, silent=False, source_profile=True)
-                self.ssh.switch_user(orig_user)
-                return self.ssh.get_last_status()
-            self.ssh.interactive_shell(user=user)
+            raise Exception("Native ssh client not found")
+            # log.debug("Using Pure-Python SSH client")
+            # if forward_x11:
+            #     log.warn("X11 Forwarding not available in Python SSH client")
+            # if command:
+            #     orig_user = self.ssh.get_current_user()
+            #     self.ssh.switch_user(user)
+            #     self.ssh.execute(command, silent=False, source_profile=True)
+            #     self.ssh.switch_user(orig_user)
+            #     return self.ssh.get_last_status()
+            # self.ssh.interactive_shell(user=user)
 
     def get_hosts_entry(self):
         """ Returns /etc/hosts entry for this node """
