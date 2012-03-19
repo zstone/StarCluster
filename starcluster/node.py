@@ -893,9 +893,28 @@ class Node(object):
 
     def shell(self, user=None, forward_x11=False, command=None):
         """
-        Attempts to launch an interactive shell by first trying the system's
-        ssh client. If the system does not have the ssh command it falls back
-        to a pure-python ssh shell.
+        Attempts to launch an interactive shell with the system's ssh
+        client. Before the session is initiated, the host's SSH key is
+        obtained with ssh-keyscan and its fingerprint is checked against
+        the fingerprints in the instance console log (which can be
+        accessed securely using AWS credentials).
+
+        If the fingerprints match, we know we have received the real
+        host key, and it is added automatically to ~/.ssh/known_hosts,
+        which should then allow the desired SSH connection to be
+        completed securely without manual verification of the
+        fingerprint.
+
+        Strict host key checking is applied to force the ssh client to
+        reject the current connection if the provided key has not
+        already been added to known_hosts as described above; an unknown
+        key could be used to conduct a man-in-the-middle attack, though
+        there may be other explanations.
+
+        TODO: Test this code thoroughly with simulated man-in-the-middle
+        attacks and probe for other vulnerabilities. Implement automatic
+        fingerprint checking for systems that do not have a native ssh
+        client; these systems may also lack ssh-keyscan and ssh-keygen.
         """
         if self.update() != 'running':
             try:
@@ -927,8 +946,8 @@ class Node(object):
             log.info("[Have waited %s seconds total] " % (t1 - t0))
 
         # Extract the RSA host key fingerprint from the console output
-        p = re.compile("ec2: 2048 (\S+) \S+ \(RSA\)")
-        valid_fingerprint = list(set(p.findall(console_str)))[0]
+        p = re.compile(r"ec2: 2048 (\S+) \S+ \(RSA\)")
+        valid_fingerprint = set(p.findall(console_str)).pop()
 
         user = user or self.user
         if utils.has_required(['ssh']):
@@ -1003,8 +1022,7 @@ class Node(object):
                 with open(tmp_key.name) as new_tmp:
                     hashed_key = new_tmp.read()
                     with open(expanduser("~/.ssh/known_hosts"), 'a') as f:
-                        f.write(hashed_key.rstrip())
-                        f.write("\n")
+                        print >> f, hashed_key.rstrip()
             else:
                 raise Exception("ERROR: Host fingerprint mismatch")
 
