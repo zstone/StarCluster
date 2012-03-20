@@ -1871,12 +1871,16 @@ class Cluster(object):
         elif not os.path.isfile(key_location):
             raise exception.ClusterValidationError(
                 "key_location '%s' is not a file" % key_location)
+        log.debug("key_location: %s" % key_location)
         keyname = self.keyname
         keypair = self.ec2.get_keypair_or_none(keyname)
         if not keypair:
             raise exception.ClusterValidationError(
                 "Account does not contain a key with keyname: %s" % keyname)
         fingerprint = keypair.fingerprint
+        log.debug("keyname: %s" % keyname)
+        log.debug("keypair.fingerprint: %s" % fingerprint)
+        log.debug("len(keypair.fingerprint): %s" % len(fingerprint))
         try:
             open(key_location, 'r').close()
         except IOError, e:
@@ -1885,17 +1889,26 @@ class Cluster(object):
                 "Please check that the file is readable" % (key_location, e))
         if len(fingerprint) == 59:
             keyfingerprint = sshutils.get_private_rsa_fingerprint(key_location)
+            log.debug("Local key fingerprint: %s" % keyfingerprint)
+            log.debug("keypair.fingerprint: %s" % fingerprint)
             if keyfingerprint != fingerprint:
                 raise exception.ClusterValidationError(
                     "Incorrect fingerprint for key_location '%s'\n\n"
                     "local fingerprint: %s\n\nkeypair fingerprint: %s"
                     % (key_location, keyfingerprint, fingerprint))
+            else:
+                log.debug("Key fingerprints match")
         else:
+            keyfingerprint = sshutils.get_private_rsa_fingerprint(key_location)
+            log.debug("Local key fingerprint: %s" % keyfingerprint)
+            log.debug("keypair.fingerprint: %s" % fingerprint)
+            log.debug("keypair.material: %s" % material)
             # Skip fingerprint validation for keys created using EC2 import
             # keys until I can figure out the mystery behind the import keys
             # fingerprint. I'm able to match ssh-keygen's public key
             # fingerprint, however, Amazon doesn't for some reason...
-            log.warn("Skipping keypair fingerprint validation...")
+            #log.warn("Skipping keypair fingerprint validation...")
+            raise Exception("ERROR: Could not validate keypair fingerprint")
         if self.zone:
             z = self.ec2.get_zone(self.zone)
             if keypair.region != z.region:
