@@ -31,8 +31,9 @@ def create_sc_config_dirs():
     __makedirs(STARCLUSTER_PLUGIN_DIR)
     __makedirs(STARCLUSTER_LOG_DIR)
 
-
-VERSION = "0.93.2"
+# NOTE: The version number must be comparable by
+# utils.program_version_greater
+VERSION = "0.93.2.1"
 PID = os.getpid()
 TMP_DIR = tempfile.gettempdir()
 if os.path.exists("/tmp"):
