@@ -1902,7 +1902,7 @@ class Cluster(object):
             keyfingerprint = sshutils.get_private_rsa_fingerprint(key_location)
             log.debug("Local key fingerprint: %s" % keyfingerprint)
             log.debug("keypair.fingerprint: %s" % fingerprint)
-            log.debug("keypair.material: %s" % material)
+            log.debug("keypair.material: %s" % keypair.material)
             # Skip fingerprint validation for keys created using EC2 import
             # keys until I can figure out the mystery behind the import keys
             # fingerprint. I'm able to match ssh-keygen's public key
