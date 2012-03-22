@@ -946,11 +946,20 @@ class Node(object):
             log.info("[Have waited %s seconds total] " % (t1 - t0))
 
         # Attempt to extract the RSA host key fingerprint from the
-        # console output. A fingerprint should be present if the
-        # instance has only booted for the first time. If this is an
-        # EBS cluster that is being reinstantiated, however, no
-        # fingerprint will be present, and we must assume that the
-        # appropriate key has already been added to known_hosts.
+        # console output. Such a fingerprint should be printed to the
+        # console on the instance's first boot; however, at present,
+        # you must configure your instances to print the fingerprint
+        # to the console during subsequent startups. (In particular,
+        # EBS-backed instances that have been stopped and restarted
+        # will _not_ print the SSH key fingerprint to the console when
+        # reinstantiated.
+
+        # One way to configure your instances to print its SSH host
+        # key fingerprints to the console during every boot sequence
+        # is to link or copy
+        # /usr/lib/cloud-init/write-ssh-key-fingerprints
+        # into
+        # /var/lib/cloud/scripts/per-boot/ .
         p = re.compile(r"ec2: 2048 (\S+) \S+ \(RSA\)")
         fingerprint_set = set(p.findall(console_str))
         if len(fingerprint_set) > 1:
@@ -1033,8 +1042,8 @@ class Node(object):
 
                     old_key_path = tmp_key.name + ".old"
                     os.unlink(old_key_path)
-                    log.debug("[Temporary file %s now deleted " +
-                              "but not shredded]" % old_key_path)
+                    log.debug("[Temporary file %s now " % old_key_path +
+                              "deleted but not shredded]")
 
                     with open(tmp_key.name) as new_tmp:
                         hashed_key = new_tmp.read()
