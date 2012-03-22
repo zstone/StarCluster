@@ -945,9 +945,25 @@ class Node(object):
             t1 = int(time.time())
             log.info("[Have waited %s seconds total] " % (t1 - t0))
 
-        # Extract the RSA host key fingerprint from the console output
+        # Attempt to extract the RSA host key fingerprint from the
+        # console output. A fingerprint should be present if the
+        # instance has only booted for the first time. If this is an
+        # EBS cluster that is being reinstantiated, however, no
+        # fingerprint will be present, and we must assume that the
+        # appropriate key has already been added to known_hosts.
         p = re.compile(r"ec2: 2048 (\S+) \S+ \(RSA\)")
-        valid_fingerprint = set(p.findall(console_str)).pop()
+        fingerprint_set = set(p.findall(console_str))
+        if len(fingerprint_set) > 1:
+            raise Exception("Too many fingerprints in console log: %s" \
+                                % str(fingerprint_set))
+        elif len(fingerprint_set) == 1:
+            valid_fingerprint = fingerprint_set.pop()
+            log.debug("Fingerprint found in console log: %s" \
+                          % valid_fingerprint)
+        else:
+            valid_fingerprint = None
+            log.debug("No fingerprint found in console log; " +
+                      "relying on existing keys in known_hosts")
 
         user = user or self.user
         if utils.has_required(['ssh']):
@@ -965,66 +981,67 @@ class Node(object):
                 ssh_cmd = ' '.join([ssh_cmd, command])
             log.debug("ssh_cmd: %s" % ssh_cmd)
 
-            log.debug("Fetching putative host key with ssh-keyscan")
-            keyscan_cmd = "ssh-keyscan -t rsa %s" % self.dns_name
-            log.debug("ssh-keyscan_cmd: %s" % keyscan_cmd)
-            proc = subprocess.Popen(keyscan_cmd,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    shell=True)
-            putative_host_key = proc.communicate()[0]
-
-            log.debug("Computing fingerprint of putative host key")
-            tmp_key = tempfile.NamedTemporaryFile(suffix='.key')
-            tmp_key.write(putative_host_key)
-            tmp_key.flush()
-            keygen_cmd = "ssh-keygen -lf %s" % tmp_key.name
-            log.debug("ssh-keygen_cmd: %s" % keygen_cmd)
-            proc = subprocess.Popen(keygen_cmd,
-                                    stdout=subprocess.PIPE,
-                                    shell=True)
-            resp = proc.communicate()[0]
-            putative_fingerprint = resp.split(' ')[1]
-
-            log.debug("SSH key fingerprint from ssh-keyscan:")
-            log.debug(putative_fingerprint)
-            log.debug("SSH key fingerprint from console:")
-            log.debug(valid_fingerprint)
-
-            if putative_fingerprint == valid_fingerprint:
-                log.debug("Putative fingerprint matches " +
-                         "valid fingerprint as desired")
-
-                log.debug("Adding key from ssh-keyscan to known_hosts")
-                keygen_cmd_2 = "ssh-keygen -R %s" % self.dns_name
-                log.debug("ssh-keygen_cmd_2: %s" % keygen_cmd_2)
-                proc = subprocess.Popen(keygen_cmd_2,
+            if valid_fingerprint != None:
+                log.debug("Fetching putative host key with ssh-keyscan")
+                keyscan_cmd = "ssh-keyscan -t rsa %s" % self.dns_name
+                log.debug("ssh-keyscan_cmd: %s" % keyscan_cmd)
+                proc = subprocess.Popen(keyscan_cmd,
                                         stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE,
                                         shell=True)
-                resp_out, resp_err = proc.communicate()
-                log.debug(resp_err.rstrip())
+                putative_host_key = proc.communicate()[0]
 
-                keygen_cmd_3 = "ssh-keygen -H -f %s" % tmp_key.name
-                log.debug("ssh-keygen_cmd_3: %s" % keygen_cmd_3)
-                proc = subprocess.Popen(keygen_cmd_3,
+                log.debug("Computing fingerprint of putative host key")
+                tmp_key = tempfile.NamedTemporaryFile(suffix='.key')
+                tmp_key.write(putative_host_key)
+                tmp_key.flush()
+                keygen_cmd = "ssh-keygen -lf %s" % tmp_key.name
+                log.debug("ssh-keygen_cmd: %s" % keygen_cmd)
+                proc = subprocess.Popen(keygen_cmd,
                                         stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
                                         shell=True)
-                resp_out, resp_err = proc.communicate()
-                log.debug(resp_err.rstrip())
+                resp = proc.communicate()[0]
+                putative_fingerprint = resp.split(' ')[1]
 
-                old_key_path = tmp_key.name + ".old"
-                os.unlink(old_key_path)
-                log.debug("[Temporary file %s now deleted but not shredded]" \
-                             % old_key_path)
+                log.debug("SSH key fingerprint from ssh-keyscan:")
+                log.debug(putative_fingerprint)
+                log.debug("SSH key fingerprint from console:")
+                log.debug(valid_fingerprint)
 
-                with open(tmp_key.name) as new_tmp:
-                    hashed_key = new_tmp.read()
-                    with open(expanduser("~/.ssh/known_hosts"), 'a') as f:
-                        print >> f, hashed_key.rstrip()
-            else:
-                raise Exception("ERROR: Host fingerprint mismatch")
+                if putative_fingerprint == valid_fingerprint:
+                    log.debug("Putative fingerprint matches " +
+                             "valid fingerprint as desired")
+
+                    log.debug("Adding key from ssh-keyscan to known_hosts")
+                    keygen_cmd_2 = "ssh-keygen -R %s" % self.dns_name
+                    log.debug("ssh-keygen_cmd_2: %s" % keygen_cmd_2)
+                    proc = subprocess.Popen(keygen_cmd_2,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            shell=True)
+                    resp_out, resp_err = proc.communicate()
+                    log.debug(resp_err.rstrip())
+
+                    keygen_cmd_3 = "ssh-keygen -H -f %s" % tmp_key.name
+                    log.debug("ssh-keygen_cmd_3: %s" % keygen_cmd_3)
+                    proc = subprocess.Popen(keygen_cmd_3,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            shell=True)
+                    resp_out, resp_err = proc.communicate()
+                    log.debug(resp_err.rstrip())
+
+                    old_key_path = tmp_key.name + ".old"
+                    os.unlink(old_key_path)
+                    log.debug("[Temporary file %s now deleted " +
+                              "but not shredded]" % old_key_path)
+
+                    with open(tmp_key.name) as new_tmp:
+                        hashed_key = new_tmp.read()
+                        with open(expanduser("~/.ssh/known_hosts"), 'a') as f:
+                            print >> f, hashed_key.rstrip()
+                else:
+                    raise Exception("ERROR: Host fingerprint mismatch")
 
             return subprocess.call(ssh_cmd, shell=True)
         else:
