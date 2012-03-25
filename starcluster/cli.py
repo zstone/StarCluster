@@ -309,6 +309,7 @@ def main():
     static.create_sc_config_dirs()
     logger.configure_sc_logging()
     logger.configure_boto_logging()
+    logger.configure_ssh_logging()
     warn_debug_file_moved()
     StarClusterCLI().main()
 
