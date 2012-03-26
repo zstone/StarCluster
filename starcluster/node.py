@@ -471,6 +471,7 @@ class Node(object):
         nodes - the nodes to add to the user's known hosts file
         add_self - add this Node to known_hosts in addition to nodes
         """
+        log.debug("*** Calling node.add_to_known_hosts! ***")
         user = self.getpwnam(username)
         known_hosts_file = posixpath.join(user.pw_dir, '.ssh', 'known_hosts')
         self.remove_from_known_hosts(username, nodes)
@@ -858,8 +859,10 @@ class Node(object):
 
     def is_up(self):
         if self.update() != 'running':
+            log.debug("status is not 'running'")
             return False
         if not self.is_ssh_up():
+            log.debug("is_ssh_up() returns False")
             return False
         if self.private_ip_address is None:
             log.debug("instance %s has no private_ip_address" % self.id)
@@ -886,18 +889,183 @@ class Node(object):
     @property
     def ssh(self):
         if not self._ssh:
+            log.debug("Accessing ssh property for node %s for the first time" %
+                      self.instance.dns_name)
+
+            self.validated_host_key = self.known_hosts_key(self.dns_name)
+
+            if self.validated_host_key:
+                log.debug("Valid host key from known_hosts:")
+            else:
+                self.add_host_key_if_console_match()
+                log.debug("Validated host key from ssh-keyscan:")
+
+            log.debug(self.validated_host_key)
             self._ssh = sshutils.SSHClient(self.instance.dns_name,
+                                           host_key=self.validated_host_key,
                                            username=self.user,
                                            private_key=self.key_location)
         return self._ssh
 
+    def known_hosts_key(self, hostname):
+        """
+        Searches for the given hostname in the known_hosts file using
+        ssh-keygen. Returns True if a match is found and False
+        otherwise.
+        """
+        search_cmd = "ssh-keygen -F %s" % hostname
+        log.debug("search_cmd: %s" % search_cmd)
+        proc = subprocess.Popen(search_cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                shell=True)
+        resp_out, resp_err = proc.communicate()
+        if len(resp_out) > 0:
+            log.debug("Found host %s in known_hosts" % self.dns_name)
+            return resp_out.split('\n')[1]
+        else:
+            log.debug("Host %s unknown" % self.dns_name)
+            return False
+
+    def get_host_key_fingerprint_from_console(self):
+        """
+        Attempt to extract the RSA host key fingerprint from the
+        console output. Such a fingerprint should be printed to the
+        console on the instance's first boot; however, at present, you
+        must manually configure your instances to print their
+        fingerprints to the console during subsequent startups. (In
+        particular, EBS-backed instances that have been stopped and
+        restarted will _not_ print their SSH key fingerprints to the
+        console when reinstantiated.)
+
+        One way to configure your instances to print their SSH host
+        key fingerprints to the console during every boot sequence is
+        to link or copy /usr/lib/cloud-init/write-ssh-key-fingerprints
+        into /var/lib/cloud/scripts/per-boot/ .
+        """
+        log.debug("Fetching console output for instance %s" % self.id)
+        log.debug("Note that the console log is not available immediately; " +
+                  "this security check may take five minutes (300 seconds) " +
+                  "or more. But it's worth it to avoid man-in-the-middle " +
+                  "attacks.")
+        console_str = ''
+        t0 = int(time.time())
+        while True:
+            console_output = self.instance.get_console_output().output
+            console_str = ''.join([c for c in console_output \
+                                       if c in string.printable])
+            if len(console_str) > 0:
+                break
+            log.info("Waiting five seconds for console output " +
+                     "to become available...")
+            time.sleep(5)
+            t1 = int(time.time())
+            log.info("[Have waited %s seconds total] " % (t1 - t0))
+
+        p = re.compile(r"ec2: 2048 (\S+) \S+ \(RSA\)")
+        fingerprint_set = set(p.findall(console_str))
+        if len(fingerprint_set) > 1:
+            raise Exception("Too many fingerprints in console log: %s" \
+                                % str(fingerprint_set))
+        elif len(fingerprint_set) == 1:
+            valid_fingerprint = fingerprint_set.pop()
+            log.debug("Fingerprint found in console log: %s" \
+                          % valid_fingerprint)
+        else:
+            valid_fingerprint = None
+            log.debug("No fingerprint found in console log")
+
+        return valid_fingerprint
+
+    def add_host_key_if_console_match(self):
+        """
+        Attempts to match the putative host key obtained via
+        ssh-keyscan with the SSH host key fingerprint from the
+        instance console log; if the fingerprints match, the validated
+        host key is added to known_hosts.
+        """
+        valid_fingerprint = self.get_host_key_fingerprint_from_console()
+        if not valid_fingerprint:
+            log.debug("No keys added to known_hosts")
+            return
+
+        while True:
+            log.debug("Fetching putative host key with ssh-keyscan")
+            keyscan_cmd = "ssh-keyscan -t rsa %s" % self.dns_name
+            log.debug("ssh-keyscan_cmd: %s" % keyscan_cmd)
+            proc = subprocess.Popen(keyscan_cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    shell=True)
+            putative_host_key = proc.communicate()[0]
+            if len(putative_host_key) > 0:
+                break
+            log.info("Waiting five seconds for host key " +
+                     "to become available...")
+            time.sleep(5)
+
+        log.debug("Computing fingerprint of putative host key")
+        tmp_key = tempfile.NamedTemporaryFile(suffix='.key')
+        tmp_key.write(putative_host_key)
+        tmp_key.flush()
+        keygen_cmd = "ssh-keygen -lf %s" % tmp_key.name
+        log.debug("ssh-keygen_cmd: %s" % keygen_cmd)
+        proc = subprocess.Popen(keygen_cmd,
+                                stdout=subprocess.PIPE,
+                                shell=True)
+        resp = proc.communicate()[0]
+        putative_fingerprint = resp.split(' ')[1]
+
+        log.debug("SSH key fingerprint from ssh-keyscan:")
+        log.debug(putative_fingerprint)
+        log.debug("SSH key fingerprint from console:")
+        log.debug(valid_fingerprint)
+
+        if putative_fingerprint == valid_fingerprint:
+            log.debug("Putative fingerprint matches " +
+                     "valid fingerprint as desired")
+            self.validated_host_key = putative_host_key
+
+            log.debug("Adding key from ssh-keyscan to known_hosts")
+            keygen_cmd_2 = "ssh-keygen -R %s" % self.dns_name
+            log.debug("ssh-keygen_cmd_2: %s" % keygen_cmd_2)
+            proc = subprocess.Popen(keygen_cmd_2,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    shell=True)
+            resp_out, resp_err = proc.communicate()
+            log.debug(resp_err.rstrip())
+
+            keygen_cmd_3 = "ssh-keygen -H -f %s" % tmp_key.name
+            log.debug("ssh-keygen_cmd_3: %s" % keygen_cmd_3)
+            proc = subprocess.Popen(keygen_cmd_3,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    shell=True)
+            resp_out, resp_err = proc.communicate()
+            log.debug(resp_err.rstrip())
+
+            old_key_path = tmp_key.name + ".old"
+            os.unlink(old_key_path)
+            log.debug("[Temporary file %s now " % old_key_path +
+                      "deleted but not shredded]")
+
+            with open(tmp_key.name) as new_tmp:
+                hashed_key = new_tmp.read()
+                with open(expanduser("~/.ssh/known_hosts"), 'a') as f:
+                    print >> f, hashed_key.rstrip()
+        else:
+            raise Exception("ERROR: Host fingerprint mismatch")
+
     def shell(self, user=None, forward_x11=False, command=None):
         """
         Attempts to launch an interactive shell with the system's ssh
-        client. Before the session is initiated, the host's SSH key is
-        obtained with ssh-keyscan and its fingerprint is checked against
-        the fingerprints in the instance console log (which can be
-        accessed securely using AWS credentials).
+        client. Before the session is initiated, the known_hosts file
+        is checked for this node's hostname. If this host is unknown,
+        the host's SSH key is obtained with ssh-keyscan and its
+        fingerprint is checked against the fingerprints in the
+        instance's console log (which can be accessed securely using
+        AWS credentials).
 
         If the fingerprints match, we know we have received the real
         host key, and it is added automatically to ~/.ssh/known_hosts,
@@ -907,14 +1075,15 @@ class Node(object):
 
         Strict host key checking is applied to force the ssh client to
         reject the current connection if the provided key has not
-        already been added to known_hosts as described above; an unknown
-        key could be used to conduct a man-in-the-middle attack, though
-        there may be other explanations.
+        already been added to known_hosts as described above; this
+        should mitigate the possibility of man-in-the-middle attacks
+        in this context.
 
-        TODO: Test this code thoroughly with simulated man-in-the-middle
-        attacks and probe for other vulnerabilities. Implement automatic
-        fingerprint checking for systems that do not have a native ssh
-        client; these systems may also lack ssh-keyscan and ssh-keygen.
+        TODO: Test this code with simulated man-in-the-middle attacks
+        and probe for other vulnerabilities in this code path and
+        elsewhere in StarCluster. Implement automatic fingerprint
+        checking for systems that do not have a native ssh client;
+        these systems may also lack ssh-keyscan and ssh-keygen.
         """
         if self.update() != 'running':
             try:
@@ -930,54 +1099,14 @@ class Node(object):
             raise exception.InstanceNotRunning(instance_id, self.state,
                                                label=label)
 
-        log.debug("Fetching console output for instance %s" % self.id)
-        console_str = ''
-        t0 = int(time.time())
-        while True:
-            console_output = self.instance.get_console_output().output
-            console_str = ''.join([c for c in console_output \
-                                       if c in string.printable])
-            if len(console_str) > 0:
-                break
-            log.info("Waiting five seconds for console output " +
-                     "to become available...")
-            time.sleep(5)
-            t1 = int(time.time())
-            log.info("[Have waited %s seconds total] " % (t1 - t0))
-
-        # Attempt to extract the RSA host key fingerprint from the
-        # console output. Such a fingerprint should be printed to the
-        # console on the instance's first boot; however, at present,
-        # you must configure your instances to print the fingerprint
-        # to the console during subsequent startups. (In particular,
-        # EBS-backed instances that have been stopped and restarted
-        # will _not_ print the SSH key fingerprint to the console when
-        # reinstantiated.
-
-        # One way to configure your instances to print its SSH host
-        # key fingerprints to the console during every boot sequence
-        # is to link or copy
-        # /usr/lib/cloud-init/write-ssh-key-fingerprints
-        # into
-        # /var/lib/cloud/scripts/per-boot/ .
-        p = re.compile(r"ec2: 2048 (\S+) \S+ \(RSA\)")
-        fingerprint_set = set(p.findall(console_str))
-        if len(fingerprint_set) > 1:
-            raise Exception("Too many fingerprints in console log: %s" \
-                                % str(fingerprint_set))
-        elif len(fingerprint_set) == 1:
-            valid_fingerprint = fingerprint_set.pop()
-            log.debug("Fingerprint found in console log: %s" \
-                          % valid_fingerprint)
-        else:
-            valid_fingerprint = None
-            log.debug("No fingerprint found in console log; " +
-                      "relying on existing keys in known_hosts")
-
-        user = user or self.user
         if utils.has_required(['ssh']):
             log.debug("Using native OpenSSH client")
 
+            # Search for this node's hostname in known_hosts
+            if not self.known_hosts_key(self.dns_name):
+                self.add_host_key_if_console_match()
+
+            user = user or self.user
             # Force the SSH connection to fail if the provided key
             # fingerprint does not match the one in the console output
             sshopts = '-o StrictHostKeyChecking=yes -i %s' % self.key_location
@@ -988,70 +1117,8 @@ class Node(object):
             if command:
                 command = "'source /etc/profile && %s'" % command
                 ssh_cmd = ' '.join([ssh_cmd, command])
+
             log.debug("ssh_cmd: %s" % ssh_cmd)
-
-            if valid_fingerprint != None:
-                log.debug("Fetching putative host key with ssh-keyscan")
-                keyscan_cmd = "ssh-keyscan -t rsa %s" % self.dns_name
-                log.debug("ssh-keyscan_cmd: %s" % keyscan_cmd)
-                proc = subprocess.Popen(keyscan_cmd,
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
-                                        shell=True)
-                putative_host_key = proc.communicate()[0]
-
-                log.debug("Computing fingerprint of putative host key")
-                tmp_key = tempfile.NamedTemporaryFile(suffix='.key')
-                tmp_key.write(putative_host_key)
-                tmp_key.flush()
-                keygen_cmd = "ssh-keygen -lf %s" % tmp_key.name
-                log.debug("ssh-keygen_cmd: %s" % keygen_cmd)
-                proc = subprocess.Popen(keygen_cmd,
-                                        stdout=subprocess.PIPE,
-                                        shell=True)
-                resp = proc.communicate()[0]
-                putative_fingerprint = resp.split(' ')[1]
-
-                log.debug("SSH key fingerprint from ssh-keyscan:")
-                log.debug(putative_fingerprint)
-                log.debug("SSH key fingerprint from console:")
-                log.debug(valid_fingerprint)
-
-                if putative_fingerprint == valid_fingerprint:
-                    log.debug("Putative fingerprint matches " +
-                             "valid fingerprint as desired")
-
-                    log.debug("Adding key from ssh-keyscan to known_hosts")
-                    keygen_cmd_2 = "ssh-keygen -R %s" % self.dns_name
-                    log.debug("ssh-keygen_cmd_2: %s" % keygen_cmd_2)
-                    proc = subprocess.Popen(keygen_cmd_2,
-                                            stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE,
-                                            shell=True)
-                    resp_out, resp_err = proc.communicate()
-                    log.debug(resp_err.rstrip())
-
-                    keygen_cmd_3 = "ssh-keygen -H -f %s" % tmp_key.name
-                    log.debug("ssh-keygen_cmd_3: %s" % keygen_cmd_3)
-                    proc = subprocess.Popen(keygen_cmd_3,
-                                            stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE,
-                                            shell=True)
-                    resp_out, resp_err = proc.communicate()
-                    log.debug(resp_err.rstrip())
-
-                    old_key_path = tmp_key.name + ".old"
-                    os.unlink(old_key_path)
-                    log.debug("[Temporary file %s now " % old_key_path +
-                              "deleted but not shredded]")
-
-                    with open(tmp_key.name) as new_tmp:
-                        hashed_key = new_tmp.read()
-                        with open(expanduser("~/.ssh/known_hosts"), 'a') as f:
-                            print >> f, hashed_key.rstrip()
-                else:
-                    raise Exception("ERROR: Host fingerprint mismatch")
-
             return subprocess.call(ssh_cmd, shell=True)
         else:
             raise Exception("Native ssh client not found")

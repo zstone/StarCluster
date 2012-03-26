@@ -43,10 +43,14 @@ class SSHClient(object):
     private key authentication. Once established, this object allows executing
     commands, copying files to/from the remote host, various file querying
     similar to os.path.*, and much more.
+
+    NOTE: This modified version requires a known-good host key against which
+    the host key obtained during any connection attempt should be validated.
     """
 
     def __init__(self,
                  host,
+                 host_key,
                  username=None,
                  password=None,
                  private_key=None,
@@ -54,7 +58,11 @@ class SSHClient(object):
                  port=22,
                  timeout=30):
         self._host = host
-        self._port = 22
+        self._host_key = host_key
+        # The host key must be wrapped in a PKey object before it is passed
+        # to Transport.connect
+        self._host_pkey = self.load_host_key(host_key)
+        self._port = port
         self._pkey = None
         self._username = username or os.environ['LOGNAME']
         self._password = password
@@ -69,6 +77,23 @@ class SSHClient(object):
             raise exception.SSHNoCredentialsError()
         self._glob = SSHGlob(self)
         self.__last_status = None
+
+    def load_host_key(self, host_key):
+        try:
+            # HostKeyEntry.from_line expects a line that is suitable
+            # for a known_hosts file
+            entry = ssh.hostkeys.HostKeyEntry.from_line(host_key.strip())
+            if entry.valid:
+                log.debug("Created RSAKey object for provided host key")
+                return entry.key
+            else:
+                log.debug("entry.valid: %s" % entry.valid)
+                log.debug("entry.hostnames: %s" % entry.hostnames)
+                log.debug("type(entry.key): %s" % type(entry.key))
+                raise Exception("ERROR: Unable to parse host_key %s" %
+                                host_key)
+        except ssh.SSHException:
+            log.error('invalid rsa host key')
 
     def load_private_key(self, private_key, private_key_pass=None):
         # Use Private Key.
@@ -88,6 +113,7 @@ class SSHClient(object):
     def connect(self, host=None, username=None, password=None,
                 private_key=None, private_key_pass=None, port=22, timeout=30):
         host = host or self._host
+        host_pkey = self._host_pkey
         username = username or self._username
         password = password or self._password
         pkey = self._pkey
@@ -103,7 +129,10 @@ class SSHClient(object):
             raise exception.SSHConnectionError(host, port)
         # Authenticate the transport.
         try:
-            transport.connect(username=username, pkey=pkey, password=password)
+            transport.connect(hostkey=host_pkey,
+                              username=username,
+                              pkey=pkey,
+                              password=password)
         except ssh.AuthenticationException:
             raise exception.SSHAuthException(username, host)
         except ssh.SSHException, e:
