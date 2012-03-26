@@ -986,8 +986,7 @@ class Node(object):
         """
         valid_fingerprint = self.get_host_key_fingerprint_from_console()
         if not valid_fingerprint:
-            log.debug("No keys added to known_hosts")
-            return
+            raise Exception("No fingerprint found in console log")
 
         while True:
             log.debug("Fetching putative host key with ssh-keyscan")
